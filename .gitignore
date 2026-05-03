@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# PyCharm
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Temporary extracted packages
+_tmp_db/
+_tmp_ml/
+*.zip
+
+# Generated data - too large for GitHub
+data/raw/exports_medium/
+data/raw/exports_medium_pg/
+data/raw/exports_small/
+data/raw/exports_tiny_validation/
+data/processed/
+
+# Local PostgreSQL loading script with machine-specific paths
+database/load_postgres_local.sql
+
+# Temporary sharing/context folders
+_share_db_context/
+db_context_for_chatgpt.zip
+
+# Model artifacts
+outputs/models/
+*.joblib
+*.pkl
+
+# System files
+.DS_Store
+Thumbs.db
