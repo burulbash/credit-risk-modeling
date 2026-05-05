@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import getpass
-import os
+import sys
 from pathlib import Path
-from urllib.parse import quote_plus
 
 import joblib
 import matplotlib
@@ -13,258 +11,212 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine
-
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    average_precision_score,
-    brier_score_loss,
-    roc_auc_score,
-    roc_curve,
-)
-
+from sklearn.isotonic import IsotonicRegression
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-REPORTS_DIR = PROJECT_ROOT / "outputs" / "reports"
-PLOTS_DIR = PROJECT_ROOT / "outputs" / "plots"
-MODELS_DIR = PROJECT_ROOT / "outputs" / "models"
+sys.path.append(str(PROJECT_ROOT))
 
-TARGET = "target_default_90dpd_12m"
-DATE_COL = "application_date"
-
-ID_AND_DATE_COLS = [
-    "loan_id",
-    "application_id",
-    "client_id",
-    "application_date",
-    "disbursement_date",
-]
-
-LEAKAGE_AND_HELPER_COLS = [
-    "target_default_90dpd_12m",
-    "target_ever30_6m",
-    "max_observed_mob",
-    "max_dpd_12m",
-    "first_90dpd_mob",
-    "ead_proxy_12m",
-    "lgd_proxy",
-    "total_recovered_amount",
-    "collections_actions_count",
-    "ever_contact_success_flag",
-    "engine_scorecard_score",
-    "engine_pd_estimate",
-    "engine_risk_grade",
-    "engine_policy_version",
-    "engine_offered_amount",
-    "engine_offered_term_months",
-    "engine_offered_rate",
-    "engine_rule_hits_count",
-]
+from src.config import DATE_COL, PD_MODELS_DIR, PLOTS_DIR, REPORTS_DIR, TARGET  # noqa: E402
+from src.db import read_csv_table, read_postgres_table  # noqa: E402
+from src.metrics import compute_binary_metrics  # noqa: E402
+from src.splitting import make_time_split  # noqa: E402
 
 
-def ensure_dirs() -> None:
+ID_COLS = ["loan_id", "application_id", "client_id", DATE_COL, TARGET]
+
+
+def ensure_output_dirs() -> None:
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def build_engine(args: argparse.Namespace):
-    password = args.db_password or os.getenv("PGPASSWORD")
-    if password is None:
-        password = getpass.getpass(f"Password for PostgreSQL user {args.db_user}: ")
+def predict_positive_class(model, x: pd.DataFrame) -> np.ndarray:
+    if not hasattr(model, "predict_proba"):
+        raise TypeError(f"Loaded artifact {type(model)} does not support predict_proba.")
 
-    url = (
-        f"postgresql+psycopg2://{args.db_user}:{quote_plus(password)}"
-        f"@{args.db_host}:{args.db_port}/{args.db_name}"
-    )
-    return create_engine(url)
+    return model.predict_proba(x)[:, 1]
 
 
-def load_mart(args: argparse.Namespace) -> pd.DataFrame:
-    engine = build_engine(args)
-    df = pd.read_sql(f"SELECT * FROM {args.table_name};", engine)
-    df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
-    df[TARGET] = df[TARGET].astype(int)
-    print(f"Loaded mart shape: {df.shape}")
-    return df
-
-
-def make_time_split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    df = df.sort_values(DATE_COL).reset_index(drop=True)
-
-    n = len(df)
-    train_end = int(n * 0.70)
-    valid_end = int(n * 0.85)
-
-    return (
-        df.iloc[:train_end].copy(),
-        df.iloc[train_end:valid_end].copy(),
-        df.iloc[valid_end:].copy(),
-    )
-
-
-def get_feature_columns(df: pd.DataFrame) -> list[str]:
-    drop_cols = set(ID_AND_DATE_COLS + LEAKAGE_AND_HELPER_COLS)
-
-    suspicious_tokens = [
-        "target",
-        "future",
-        "recovered",
-        "collection",
-        "dpd_12m",
-        "first_90",
-        "max_dpd",
-        "observed_mob",
-    ]
-
-    feature_cols = []
-    for col in df.columns:
-        if col in drop_cols:
-            continue
-        low = col.lower()
-        if any(token in low for token in suspicious_tokens):
-            continue
-        feature_cols.append(col)
-
-    return feature_cols
-
-
-def logit(p: np.ndarray) -> np.ndarray:
-    p = np.clip(p, 1e-6, 1 - 1e-6)
-    return np.log(p / (1 - p))
-
-
-def compute_metrics(y_true: np.ndarray, y_score: np.ndarray) -> dict[str, float]:
-    auc = roc_auc_score(y_true, y_score)
-    fpr, tpr, _ = roc_curve(y_true, y_score)
-
-    return {
-        "roc_auc": float(auc),
-        "gini": float(2 * auc - 1),
-        "ks": float(np.max(tpr - fpr)),
-        "average_precision": float(average_precision_score(y_true, y_score)),
-        "brier_score": float(brier_score_loss(y_true, y_score)),
-        "mean_predicted_pd": float(np.mean(y_score)),
-        "observed_default_rate": float(np.mean(y_true)),
-    }
-
-
-def calibration_table(
-    df: pd.DataFrame,
-    score_col: str,
+def build_pd_bands(
+    y_true: pd.Series,
+    y_score: np.ndarray,
     model_name: str,
     prediction_type: str,
-    n_bins: int = 10,
+    n_bands: int = 10,
 ) -> pd.DataFrame:
-    data = df[[TARGET, score_col]].dropna().copy()
-    data["pd_band"] = pd.qcut(data[score_col], q=n_bins, duplicates="drop")
-
-    table = (
-        data.groupby("pd_band", observed=True)
-        .agg(
-            loans=(TARGET, "size"),
-            defaults=(TARGET, "sum"),
-            avg_predicted_pd=(score_col, "mean"),
-            observed_default_rate=(TARGET, "mean"),
-            min_predicted_pd=(score_col, "min"),
-            max_predicted_pd=(score_col, "max"),
-        )
-        .reset_index()
+    data = pd.DataFrame(
+        {
+            "target": y_true.to_numpy(),
+            "score": y_score,
+        }
     )
 
-    table.insert(0, "model", model_name)
-    table.insert(1, "prediction_type", prediction_type)
-    table["band_number"] = np.arange(1, len(table) + 1)
-    table["calibration_error"] = table["avg_predicted_pd"] - table["observed_default_rate"]
-    table["abs_calibration_error"] = table["calibration_error"].abs()
+    data["band"] = pd.qcut(
+        data["score"].rank(method="first"),
+        q=n_bands,
+        labels=False,
+        duplicates="drop",
+    )
 
-    return table
+    report = (
+        data.groupby("band", as_index=False)
+        .agg(
+            rows=("target", "size"),
+            defaults=("target", "sum"),
+            observed_default_rate=("target", "mean"),
+            mean_predicted_pd=("score", "mean"),
+            min_predicted_pd=("score", "min"),
+            max_predicted_pd=("score", "max"),
+        )
+        .sort_values("band")
+    )
+
+    report["model"] = model_name
+    report["prediction_type"] = prediction_type
+
+    return report[
+        [
+            "model",
+            "prediction_type",
+            "band",
+            "rows",
+            "defaults",
+            "observed_default_rate",
+            "mean_predicted_pd",
+            "min_predicted_pd",
+            "max_predicted_pd",
+        ]
+    ]
 
 
 def plot_raw_vs_calibrated(
-    table: pd.DataFrame,
+    bands: pd.DataFrame,
     model_name: str,
 ) -> None:
-    plt.figure(figsize=(7, 5))
+    model_bands = bands[bands["model"] == model_name].copy()
 
-    for prediction_type in ["raw", "calibrated"]:
-        sub = table[table["prediction_type"] == prediction_type]
-        plt.plot(
-            sub["avg_predicted_pd"],
-            sub["observed_default_rate"],
+    if model_bands.empty:
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    for prediction_type, group in model_bands.groupby("prediction_type"):
+        ax.plot(
+            group["band"],
+            group["mean_predicted_pd"],
             marker="o",
-            label=prediction_type,
+            label=f"{prediction_type}: predicted PD",
         )
 
-    max_value = max(
-        table["avg_predicted_pd"].max(),
-        table["observed_default_rate"].max(),
-        0.01,
+    observed = (
+        model_bands[model_bands["prediction_type"] == "raw"]
+        .sort_values("band")
+        [["band", "observed_default_rate"]]
     )
 
-    plt.plot([0, max_value], [0, max_value], linestyle="--", label="perfect")
-    plt.xlabel("Average predicted PD")
-    plt.ylabel("Observed default rate")
-    plt.title(f"Raw vs calibrated PD - {model_name} - OOT")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(PLOTS_DIR / f"calibration_raw_vs_calibrated_{model_name}_oot.png", dpi=140)
-    plt.close()
+    if observed.empty:
+        observed = (
+            model_bands.sort_values("band")
+            .drop_duplicates("band")
+            [["band", "observed_default_rate"]]
+        )
+
+    ax.plot(
+        observed["band"],
+        observed["observed_default_rate"],
+        marker="o",
+        linestyle="--",
+        label="observed default rate",
+    )
+
+    ax.set_title(f"Raw vs calibrated PD by band - {model_name}")
+    ax.set_xlabel("PD band")
+    ax.set_ylabel("Rate")
+    ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(PLOTS_DIR / f"calibration_raw_vs_calibrated_{model_name}_oot.png", dpi=140)
+    plt.close(fig)
+
+
+def load_data(args: argparse.Namespace) -> pd.DataFrame:
+    if args.source == "csv":
+        return read_csv_table(args.csv_path)
+
+    return read_postgres_table(
+        table_name=args.table,
+        db_host=args.db_host,
+        db_port=args.db_port,
+        db_name=args.db_name,
+        db_user=args.db_user,
+    )
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Calibrate PD model probabilities.")
+    parser.add_argument("--source", choices=["postgres", "csv"], default="postgres")
+    parser.add_argument("--csv-path", default=None)
 
     parser.add_argument("--db-host", default="localhost")
     parser.add_argument("--db-port", default="5432")
     parser.add_argument("--db-name", default="credit_risk_synth")
     parser.add_argument("--db-user", default="postgres")
-    parser.add_argument("--db-password", default=None)
-    parser.add_argument("--table-name", default="credit_risk_modeling_mart")
+    parser.add_argument("--table", default="credit_risk_modeling_mart")
 
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    ensure_dirs()
+    ensure_output_dirs()
 
-    df = load_mart(args)
-    train_df, valid_df, oot_df = make_time_split(df)
-    feature_cols = get_feature_columns(df)
+    df = load_data(args)
 
-    y_valid = valid_df[TARGET].astype(int).to_numpy()
-    y_oot = oot_df[TARGET].astype(int).to_numpy()
+    if TARGET not in df.columns:
+        raise ValueError(f"Target column is missing: {TARGET}")
 
-    model_paths = sorted(MODELS_DIR.glob("*.joblib"))
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
+    df = df.dropna(subset=[DATE_COL, TARGET]).copy()
+
+    train_df, valid_df, oot_df, _ = make_time_split(df)
+
+    model_paths = sorted(PD_MODELS_DIR.glob("*.joblib"))
+
     if not model_paths:
-        raise FileNotFoundError("No model artifacts found in outputs/models. Run src/train_pd.py first.")
+        raise FileNotFoundError(
+            f"No PD model artifacts found in {PD_MODELS_DIR}. "
+            "Run src/train_pd.py first."
+        )
 
-    summary_rows = []
-    all_band_tables = []
+    print(f"Loaded mart shape: {df.shape}")
+    print(f"Reading PD models from: {PD_MODELS_DIR}")
 
-    oot_predictions = oot_df[
-        ["loan_id", "application_id", "client_id", "application_date", TARGET]
-    ].copy()
+    summary_rows: list[dict[str, object]] = []
+    band_reports: list[pd.DataFrame] = []
+
+    oot_predictions = oot_df[[col for col in ID_COLS if col in oot_df.columns]].copy()
 
     for model_path in model_paths:
         model_name = model_path.stem
         print(f"Calibrating model: {model_name}")
 
-        pipeline = joblib.load(model_path)
+        model = joblib.load(model_path)
 
-        raw_valid = pipeline.predict_proba(valid_df[feature_cols])[:, 1]
-        raw_oot = pipeline.predict_proba(oot_df[feature_cols])[:, 1]
+        valid_raw = predict_positive_class(model, valid_df)
+        oot_raw = predict_positive_class(model, oot_df)
 
-        calibrator = LogisticRegression(solver="lbfgs")
-        calibrator.fit(logit(raw_valid).reshape(-1, 1), y_valid)
+        calibrator = IsotonicRegression(out_of_bounds="clip")
+        calibrator.fit(valid_raw, valid_df[TARGET].to_numpy())
 
-        calibrated_oot = calibrator.predict_proba(logit(raw_oot).reshape(-1, 1))[:, 1]
+        oot_calibrated = calibrator.predict(oot_raw)
+        oot_calibrated = np.clip(oot_calibrated, 0.0, 1.0)
 
-        for prediction_type, score in [
-            ("raw", raw_oot),
-            ("calibrated", calibrated_oot),
+        for prediction_type, scores in [
+            ("raw", oot_raw),
+            ("calibrated", oot_calibrated),
         ]:
-            metrics = compute_metrics(y_oot, score)
+            metrics = compute_binary_metrics(oot_df[TARGET], scores)
+
             summary_rows.append(
                 {
                     "model": model_name,
@@ -273,42 +225,39 @@ def main() -> None:
                 }
             )
 
-        temp = oot_df[[TARGET]].copy()
-        temp[f"pd_{model_name}_raw"] = raw_oot
-        temp[f"pd_{model_name}_calibrated"] = calibrated_oot
+            band_reports.append(
+                build_pd_bands(
+                    y_true=oot_df[TARGET],
+                    y_score=scores,
+                    model_name=model_name,
+                    prediction_type=prediction_type,
+                )
+            )
 
-        raw_table = calibration_table(
-            temp,
-            score_col=f"pd_{model_name}_raw",
-            model_name=model_name,
-            prediction_type="raw",
-        )
-        calibrated_table = calibration_table(
-            temp,
-            score_col=f"pd_{model_name}_calibrated",
-            model_name=model_name,
-            prediction_type="calibrated",
-        )
+        oot_predictions[f"pd_{model_name}_raw"] = oot_raw
+        oot_predictions[f"pd_{model_name}_calibrated"] = oot_calibrated
 
-        combined_table = pd.concat([raw_table, calibrated_table], ignore_index=True)
-        all_band_tables.append(combined_table)
-        plot_raw_vs_calibrated(combined_table, model_name)
-
-        oot_predictions[f"pd_{model_name}_raw"] = raw_oot
-        oot_predictions[f"pd_{model_name}_calibrated"] = calibrated_oot
-
-    summary = pd.DataFrame(summary_rows).sort_values(
-        ["model", "prediction_type"]
+    summary = (
+        pd.DataFrame(summary_rows)
+        .sort_values(["model", "prediction_type"])
+        .reset_index(drop=True)
     )
-    band_report = pd.concat(all_band_tables, ignore_index=True)
+
+    bands = pd.concat(band_reports, ignore_index=True)
 
     summary.to_csv(REPORTS_DIR / "probability_calibration_summary.csv", index=False)
-    band_report.to_csv(REPORTS_DIR / "probability_calibration_by_band.csv", index=False)
+    bands.to_csv(REPORTS_DIR / "probability_calibration_by_band.csv", index=False)
     oot_predictions.to_csv(REPORTS_DIR / "oot_predictions_pd_models_calibrated.csv", index=False)
 
-    print("\nProbability calibration summary")
+    for model_name in summary["model"].unique():
+        plot_raw_vs_calibrated(bands, model_name)
+
+    print()
+    print("Probability calibration summary")
     print(summary)
-    print(f"\nSaved: {REPORTS_DIR / 'probability_calibration_summary.csv'}")
+
+    print()
+    print(f"Saved: {REPORTS_DIR / 'probability_calibration_summary.csv'}")
     print(f"Saved: {REPORTS_DIR / 'probability_calibration_by_band.csv'}")
     print(f"Saved: {REPORTS_DIR / 'oot_predictions_pd_models_calibrated.csv'}")
 

@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import argparse
-import getpass
-import os
+import sys
 from pathlib import Path
-from urllib.parse import quote_plus
 
 import joblib
 import matplotlib
@@ -13,24 +11,27 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from sqlalchemy import create_engine
-
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    average_precision_score,
-    brier_score_loss,
-    roc_auc_score,
-    roc_curve,
-)
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-REPORTS_DIR = PROJECT_ROOT / "outputs" / "reports"
-PLOTS_DIR = PROJECT_ROOT / "outputs" / "plots"
-MODELS_DIR = PROJECT_ROOT / "outputs" / "models"
+sys.path.append(str(PROJECT_ROOT))
 
-TARGET = "target_default_90dpd_12m"
-DATE_COL = "application_date"
+from src.config import (  # noqa: E402
+    DATE_COL,
+    PLOTS_DIR,
+    REPORTS_DIR,
+    SCORECARD_BAND_LABELS,
+    SCORECARD_BANDS,
+    SCORECARD_BASE_ODDS,
+    SCORECARD_BASE_SCORE,
+    SCORECARD_MODELS_DIR,
+    SCORECARD_PDO,
+    TARGET,
+)
+from src.db import read_csv_table, read_postgres_table  # noqa: E402
+from src.metrics import compute_binary_metrics  # noqa: E402
+from src.splitting import make_time_split  # noqa: E402
+
 
 SCORECARD_FEATURES = [
     "bureau_score",
@@ -83,35 +84,34 @@ SCORECARD_FEATURES = [
 ]
 
 
-def ensure_dirs() -> None:
-    for d in [REPORTS_DIR, PLOTS_DIR, MODELS_DIR]:
-        d.mkdir(parents=True, exist_ok=True)
+ID_COLS = ["loan_id", "application_id", "client_id", DATE_COL, TARGET]
 
 
-def build_engine(args: argparse.Namespace):
-    password = args.db_password or os.getenv("PGPASSWORD")
-    if password is None:
-        password = getpass.getpass(f"Password for PostgreSQL user {args.db_user}: ")
-
-    url = (
-        f"postgresql+psycopg2://{args.db_user}:{quote_plus(password)}"
-        f"@{args.db_host}:{args.db_port}/{args.db_name}"
-    )
-    return create_engine(url)
+def ensure_output_dirs() -> None:
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+    PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+    SCORECARD_MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_data(args: argparse.Namespace) -> pd.DataFrame:
-    engine = build_engine(args)
+    if args.source == "csv":
+        df = read_csv_table(args.csv_path)
+    else:
+        df = read_postgres_table(
+            table_name=args.table,
+            db_host=args.db_host,
+            db_port=args.db_port,
+            db_name=args.db_name,
+            db_user=args.db_user,
+        )
 
-    cols = ["loan_id", "application_id", "client_id", DATE_COL, TARGET] + SCORECARD_FEATURES
-    cols_sql = ", ".join(cols)
+    required_cols = ID_COLS + [col for col in SCORECARD_FEATURES if col in df.columns]
+    missing_id_cols = [col for col in ID_COLS if col not in df.columns]
 
-    query = f"""
-        SELECT {cols_sql}
-        FROM {args.table_name}
-    """
+    if missing_id_cols:
+        raise ValueError(f"Missing required columns: {missing_id_cols}")
 
-    df = pd.read_sql(query, engine)
+    df = df[required_cols].copy()
     df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
     df[TARGET] = df[TARGET].astype(int)
 
@@ -119,19 +119,6 @@ def load_data(args: argparse.Namespace) -> pd.DataFrame:
     print(f"Default rate: {df[TARGET].mean():.4f}")
 
     return df
-
-
-def make_time_split(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    df = df.sort_values(DATE_COL).reset_index(drop=True)
-    n = len(df)
-    train_end = int(n * 0.70)
-    valid_end = int(n * 0.85)
-
-    return (
-        df.iloc[:train_end].copy(),
-        df.iloc[train_end:valid_end].copy(),
-        df.iloc[valid_end:].copy(),
-    )
 
 
 def compute_woe_table(
@@ -161,7 +148,7 @@ def compute_woe_table(
 
         if non_missing.nunique() <= 2:
             binned = numeric_x.astype("Int64").astype(str)
-            binned = binned.replace("<NA>", "MISSING")
+            binned = binned.replace("", "MISSING")
             meta["is_numeric"] = False
         else:
             quantiles = np.linspace(0, 1, max_bins + 1)
@@ -169,19 +156,22 @@ def compute_woe_table(
 
             if len(edges) < 3:
                 binned = numeric_x.astype("Int64").astype(str)
-                binned = binned.replace("<NA>", "MISSING")
+                binned = binned.replace("", "MISSING")
                 meta["is_numeric"] = False
             else:
                 edges[0] = -np.inf
                 edges[-1] = np.inf
+
                 binned = pd.cut(numeric_x, bins=edges, include_lowest=True).astype(str)
                 binned = binned.where(~numeric_x.isna(), "MISSING")
                 meta["edges"] = edges
     else:
         raw = x.astype("object").where(~x.isna(), "MISSING").astype(str)
         value_share = raw.value_counts(normalize=True)
+
         top_categories = value_share[value_share >= min_category_share].index.tolist()
         binned = raw.where(raw.isin(top_categories), "OTHER")
+
         meta["top_categories"] = top_categories
 
     temp = pd.DataFrame({"bin": binned, "target": y})
@@ -202,6 +192,7 @@ def compute_woe_table(
     total_bad = grouped["bad"].sum()
 
     smoothing = 0.5
+
     grouped["good_dist"] = (grouped["good"] + smoothing) / (
         total_good + smoothing * len(grouped)
     )
@@ -211,13 +202,14 @@ def compute_woe_table(
 
     grouped["woe"] = np.log(grouped["good_dist"] / grouped["bad_dist"])
     grouped["iv_component"] = (grouped["good_dist"] - grouped["bad_dist"]) * grouped["woe"]
+
     grouped["feature"] = feature
     grouped["iv"] = grouped["iv_component"].sum()
 
     meta["woe_map"] = dict(zip(grouped["bin"].astype(str), grouped["woe"]))
     meta["default_woe"] = 0.0
 
-    grouped = grouped[
+    return grouped[
         [
             "feature",
             "bin",
@@ -231,9 +223,7 @@ def compute_woe_table(
             "iv_component",
             "iv",
         ]
-    ].sort_values(["feature", "bin"])
-
-    return grouped, meta
+    ].sort_values(["feature", "bin"]), meta
 
 
 def transform_feature_to_woe(df: pd.DataFrame, feature: str, meta: dict) -> pd.Series:
@@ -246,6 +236,7 @@ def transform_feature_to_woe(df: pd.DataFrame, feature: str, meta: dict) -> pd.S
     else:
         raw = x.astype("object").where(~x.isna(), "MISSING").astype(str)
         top_categories = meta.get("top_categories")
+
         if top_categories is not None:
             binned = raw.where(raw.isin(top_categories), "OTHER")
         else:
@@ -285,44 +276,34 @@ def build_woe_dataset(
     else:
         selected_features = selected_features[:20]
 
-    print("\nTop IV features")
+    print()
+    print("Top IV features")
     print(iv_report.head(15))
     print(f"\nSelected scorecard features: {len(selected_features)}")
 
     def transform(df: pd.DataFrame) -> pd.DataFrame:
         result = pd.DataFrame(index=df.index)
+
         for feature in selected_features:
             result[f"woe_{feature}"] = transform_feature_to_woe(df, feature, metas[feature])
+
         return result
 
-    X_train = transform(train_df)
-    X_valid = transform(valid_df)
-    X_oot = transform(oot_df)
+    x_train = transform(train_df)
+    x_valid = transform(valid_df)
+    x_oot = transform(oot_df)
 
-    selected_report = pd.DataFrame({"feature": selected_features})
-    return X_train, X_valid, X_oot, woe_bins, iv_report, metas
-
-
-def compute_metrics(y_true: np.ndarray, y_score: np.ndarray) -> dict[str, float]:
-    auc = roc_auc_score(y_true, y_score)
-    fpr, tpr, _ = roc_curve(y_true, y_score)
-
-    return {
-        "roc_auc": float(auc),
-        "gini": float(2 * auc - 1),
-        "ks": float(np.max(tpr - fpr)),
-        "average_precision": float(average_precision_score(y_true, y_score)),
-        "brier_score": float(brier_score_loss(y_true, y_score)),
-        "mean_predicted_pd": float(np.mean(y_score)),
-        "observed_default_rate": float(np.mean(y_true)),
-    }
+    return x_train, x_valid, x_oot, woe_bins, iv_report, metas
 
 
-def pd_to_score(pd_values: np.ndarray, base_score: int = 600, pdo: int = 50, base_odds: int = 20) -> np.ndarray:
+def pd_to_score(pd_values: np.ndarray) -> np.ndarray:
     pd_values = np.clip(pd_values, 1e-6, 1 - 1e-6)
-    factor = pdo / np.log(2)
-    offset = base_score - factor * np.log(base_odds)
+
+    factor = SCORECARD_PDO / np.log(2)
+    offset = SCORECARD_BASE_SCORE - factor * np.log(SCORECARD_BASE_ODDS)
+
     odds_good_bad = (1 - pd_values) / pd_values
+
     return offset + factor * np.log(odds_good_bad)
 
 
@@ -331,10 +312,11 @@ def make_score_band_report(oot_df: pd.DataFrame, y_score: np.ndarray) -> pd.Data
     report["pd_scorecard"] = y_score
     report["score"] = pd_to_score(y_score)
 
-    bins = [-np.inf, 550, 600, 650, 700, 750, np.inf]
-    labels = ["F_<550", "E_550_599", "D_600_649", "C_650_699", "B_700_749", "A_750_plus"]
-
-    report["score_band"] = pd.cut(report["score"], bins=bins, labels=labels)
+    report["score_band"] = pd.cut(
+        report["score"],
+        bins=SCORECARD_BANDS,
+        labels=SCORECARD_BAND_LABELS,
+    )
 
     band_report = (
         report.groupby("score_band", observed=True)
@@ -350,6 +332,7 @@ def make_score_band_report(oot_df: pd.DataFrame, y_score: np.ndarray) -> pd.Data
     )
 
     report.to_csv(REPORTS_DIR / "scorecard_oot_predictions.csv", index=False)
+
     return band_report
 
 
@@ -365,24 +348,27 @@ def plot_score_bands(band_report: pd.DataFrame) -> None:
     plt.close()
 
 
-def make_scorecard_points(model: LogisticRegression, woe_bins: pd.DataFrame, selected_features: list[str]) -> pd.DataFrame:
-    base_score = 600
-    pdo = 50
-    base_odds = 20
-    factor = pdo / np.log(2)
-    offset = base_score - factor * np.log(base_odds)
+def make_scorecard_points(
+    model: LogisticRegression,
+    woe_bins: pd.DataFrame,
+    selected_woe_features: list[str],
+) -> pd.DataFrame:
+    factor = SCORECARD_PDO / np.log(2)
+    offset = SCORECARD_BASE_SCORE - factor * np.log(SCORECARD_BASE_ODDS)
 
     coefficients = model.coef_.ravel()
     intercept = float(model.intercept_[0])
 
     coef_map = {
         feature.replace("woe_", ""): coef
-        for feature, coef in zip(selected_features, coefficients)
+        for feature, coef in zip(selected_woe_features, coefficients)
     }
 
     rows = []
+
     for _, row in woe_bins.iterrows():
         feature = row["feature"]
+
         if feature not in coef_map:
             continue
 
@@ -402,6 +388,7 @@ def make_scorecard_points(model: LogisticRegression, woe_bins: pd.DataFrame, sel
         )
 
     scorecard = pd.DataFrame(rows)
+
     base_points = offset - factor * intercept
 
     base_row = pd.DataFrame(
@@ -422,28 +409,30 @@ def make_scorecard_points(model: LogisticRegression, woe_bins: pd.DataFrame, sel
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Build classic WOE/IV scorecard.")
+    parser.add_argument("--source", choices=["postgres", "csv"], default="postgres")
+    parser.add_argument("--csv-path", default=None)
 
     parser.add_argument("--db-host", default="localhost")
     parser.add_argument("--db-port", default="5432")
     parser.add_argument("--db-name", default="credit_risk_synth")
     parser.add_argument("--db-user", default="postgres")
-    parser.add_argument("--db-password", default=None)
-    parser.add_argument("--table-name", default="credit_risk_modeling_mart")
+    parser.add_argument("--table", default="credit_risk_modeling_mart")
 
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    ensure_dirs()
+    ensure_output_dirs()
 
     df = load_data(args)
-    train_df, valid_df, oot_df = make_time_split(df)
+
+    train_df, valid_df, oot_df, _ = make_time_split(df)
 
     available_features = [feature for feature in SCORECARD_FEATURES if feature in df.columns]
 
-    X_train, X_valid, X_oot, woe_bins, iv_report, metas = build_woe_dataset(
+    x_train, x_valid, x_oot, woe_bins, iv_report, metas = build_woe_dataset(
         train_df=train_df,
         valid_df=valid_df,
         oot_df=oot_df,
@@ -455,24 +444,32 @@ def main() -> None:
     y_oot = oot_df[TARGET].astype(int).to_numpy()
 
     model = LogisticRegression(max_iter=1000, solver="lbfgs")
-    model.fit(X_train, y_train)
+    model.fit(x_train, y_train)
 
     datasets = {
-        "train": (X_train, y_train),
-        "valid": (X_valid, y_valid),
-        "oot": (X_oot, y_oot),
+        "train": (x_train, y_train),
+        "valid": (x_valid, y_valid),
+        "oot": (x_oot, y_oot),
     }
 
     metrics_rows = []
-    for split_name, (X_split, y_split) in datasets.items():
-        y_score = model.predict_proba(X_split)[:, 1]
-        metrics_rows.append({"model": "woe_scorecard_logistic", "split": split_name, **compute_metrics(y_split, y_score)})
+
+    for split_name, (x_split, y_split) in datasets.items():
+        y_score = model.predict_proba(x_split)[:, 1]
+
+        metrics_rows.append(
+            {
+                "model": "woe_scorecard_logistic",
+                "split": split_name,
+                **compute_binary_metrics(y_split, y_score),
+            }
+        )
 
     metrics = pd.DataFrame(metrics_rows)
-    oot_pd = model.predict_proba(X_oot)[:, 1]
 
+    oot_pd = model.predict_proba(x_oot)[:, 1]
     band_report = make_score_band_report(oot_df, oot_pd)
-    scorecard_points = make_scorecard_points(model, woe_bins, list(X_train.columns))
+    scorecard_points = make_scorecard_points(model, woe_bins, list(x_train.columns))
 
     woe_bins.to_csv(REPORTS_DIR / "scorecard_woe_bins.csv", index=False)
     iv_report.to_csv(REPORTS_DIR / "scorecard_iv_report.csv", index=False)
@@ -480,29 +477,42 @@ def main() -> None:
     band_report.to_csv(REPORTS_DIR / "scorecard_bad_rate_by_score_band.csv", index=False)
     scorecard_points.to_csv(REPORTS_DIR / "scorecard_points.csv", index=False)
 
+    artifact_path = SCORECARD_MODELS_DIR / "woe_scorecard_logistic.joblib"
+
     joblib.dump(
         {
             "model": model,
-            "features": list(X_train.columns),
+            "features": list(x_train.columns),
             "woe_metadata": metas,
+            "scorecard_params": {
+                "base_score": SCORECARD_BASE_SCORE,
+                "pdo": SCORECARD_PDO,
+                "base_odds": SCORECARD_BASE_ODDS,
+                "score_bands": SCORECARD_BANDS,
+                "score_band_labels": SCORECARD_BAND_LABELS,
+            },
         },
-        MODELS_DIR / "woe_scorecard_logistic.joblib",
+        artifact_path,
     )
 
     plot_score_bands(band_report)
 
-    print("\nScorecard model metrics")
+    print()
+    print("Scorecard model metrics")
     print(metrics)
 
-    print("\nScore band report")
+    print()
+    print("Score band report")
     print(band_report)
 
-    print("\nSaved reports:")
+    print()
+    print("Saved reports:")
     print(REPORTS_DIR / "scorecard_iv_report.csv")
     print(REPORTS_DIR / "scorecard_woe_bins.csv")
     print(REPORTS_DIR / "scorecard_model_metrics.csv")
     print(REPORTS_DIR / "scorecard_bad_rate_by_score_band.csv")
     print(REPORTS_DIR / "scorecard_points.csv")
+    print(f"Scorecard artifact saved to: {artifact_path}")
 
 
 if __name__ == "__main__":

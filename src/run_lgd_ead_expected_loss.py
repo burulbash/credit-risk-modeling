@@ -83,10 +83,18 @@ def choose_pd_column(preds: pd.DataFrame, preferred_model: str) -> str:
 
 
 def make_score_bands(df: pd.DataFrame) -> pd.Series:
-    # Risk bands based on predicted PD quantiles.
-    # Band A = lowest risk, Band E = highest risk.
     labels = ["A_lowest_risk", "B", "C", "D", "E_highest_risk"]
-    return pd.qcut(df["pd"], q=5, labels=labels, duplicates="drop")
+
+    # Calibrated PD values can contain many ties, especially after isotonic calibration.
+    # Ranking before qcut keeps five stable risk buckets without dropping duplicate edges.
+    ranked_pd = df["pd"].rank(method="first")
+
+    return pd.qcut(
+        ranked_pd,
+        q=len(labels),
+        labels=labels,
+    )
+
 
 
 def summarize_by(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame:

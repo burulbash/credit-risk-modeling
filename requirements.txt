@@ -7,3 +7,5 @@ joblib
 faker
 psycopg2-binary
 SQLAlchemy
+pytest
+sqlalchemy
