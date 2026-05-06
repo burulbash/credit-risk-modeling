@@ -1,10 +1,8 @@
 # Credit Risk Modeling
 
-A small end-to-end credit risk modeling project built on synthetic lending data.
+End-to-end credit risk modeling project built on synthetic lending data.
 
 The project starts with generated relational data, loads it into PostgreSQL, builds a modeling mart with SQL, and runs several Python scripts for PD modeling, calibration, scorecarding, monitoring, and Expected Loss calculation.
-
-The data is fully synthetic. No real customer data is used.
 
 ## What is included
 
@@ -27,11 +25,16 @@ probability calibration
 WOE / IV scorecard
 PSI monitoring
 LGD / EAD / Expected Loss
+internal rating scale
+rating monotonicity checks
+PD calibration by segment
+vintage default curve analysis
+score cut-off strategy simulation
 ```
 
 ## Quick run with sample data
 
-A small sample file is included in the repository:
+Sample file is included in the repository:
 
 ```text
 data/sample/credit_risk_modeling_mart_sample.csv
@@ -50,8 +53,6 @@ python src/train_pd.py \
   --source csv \
   --csv-path data/sample/credit_risk_modeling_mart_sample.csv
 ```
-
-This is the fastest way to check that the Python modeling code runs locally.
 
 ## Full PostgreSQL run
 
@@ -89,7 +90,7 @@ psql -v ON_ERROR_STOP=1 \
   -f database/schema.sql
 ```
 
-Create a local load script with the absolute path to the generated files.
+Local load script with the absolute path to the generated files.
 
 For Git Bash on Windows:
 
@@ -162,9 +163,41 @@ python src/run_lgd_ead_expected_loss.py \
   --preferred-model xgboost
 ```
 
+Run internal rating report:
+
+```bash
+python src/run_internal_rating.py
+```
+
+Run PD segment calibration:
+
+```bash
+python src/run_pd_segment_calibration.py \
+  --source postgres \
+  --db-name credit_risk_synth \
+  --db-user postgres
+```
+
+Run vintage analysis:
+
+```bash
+python src/run_vintage_analysis.py \
+  --db-name credit_risk_synth \
+  --db-user postgres
+```
+
+Run cut-off strategy simulation:
+
+```bash
+python src/run_cutoff_strategy.py \
+  --source postgres \
+  --db-name credit_risk_synth \
+  --db-user postgres
+```
+
 ## Outputs
 
-Generated files are saved here:
+Files are saved here:
 
 ```text
 outputs/reports/
@@ -172,17 +205,13 @@ outputs/plots/
 outputs/models/
 ```
 
-The full generated dataset is not committed to the repository. It can be recreated with the data generator.
-
 ---
 
 # Кредитный риск: моделирование на синтетических данных
 
-Небольшой end-to-end проект по моделированию кредитного риска на синтетических данных.
+End-to-end проект по моделированию кредитного риска на синтетических данных.
 
-Проект начинается не с готового CSV-файла, а с набора сгенерированных связанных таблиц. Данные загружаются в PostgreSQL, затем через SQL собирается modeling mart, после чего Python-скрипты запускают PD-модель, калибровку, scorecard, PSI-мониторинг и расчёт Expected Loss.
-
-Все данные синтетические. Реальные клиентские данные не используются.
+Проект начинается не с готового CSV-файла, а с набора сгенерированных связанных таблиц. Данные загружаются в PostgreSQL, затем с SQL собираем modeling mart, после чего Python-скриптами запускаем PD-модель, калибровку, scorecard, PSI-мониторинг и расчёт Expected Loss.
 
 ## Что внутри
 
@@ -205,6 +234,11 @@ SQL modeling mart
 WOE / IV scorecard
 PSI-мониторинг
 LGD / EAD / Expected Loss
+внутренняя рейтинговая шкала
+проверка монотонности рейтингов
+калибровка PD по сегментам
+vintage-анализ дефолтов
+симуляция cut-off стратегии
 ```
 
 ## Быстрый запуск на sample-данных
@@ -229,11 +263,9 @@ python src/train_pd.py \
   --csv-path data/sample/credit_risk_modeling_mart_sample.csv
 ```
 
-Это самый быстрый способ проверить, что Python-код запускается локально.
-
 ## Полный запуск через PostgreSQL
 
-Сгенерировать синтетические данные:
+Сгенерировать данные:
 
 ```bash
 python database/generate_data.py \
@@ -267,7 +299,7 @@ psql -v ON_ERROR_STOP=1 \
   -f database/schema.sql
 ```
 
-Создать локальный load-скрипт с абсолютным путём к сгенерированным файлам.
+Локальный load-скрипт с абсолютным путём к файлам.
 
 Для Git Bash на Windows:
 
@@ -340,9 +372,41 @@ python src/run_lgd_ead_expected_loss.py \
   --preferred-model xgboost
 ```
 
+Запустить отчёт по внутреннему рейтингу:
+
+```bash
+python src/run_internal_rating.py
+```
+
+Запустить калибровку PD по сегментам:
+
+```bash
+python src/run_pd_segment_calibration.py \
+  --source postgres \
+  --db-name credit_risk_synth \
+  --db-user postgres
+```
+
+Запустить vintage-анализ:
+
+```bash
+python src/run_vintage_analysis.py \
+  --db-name credit_risk_synth \
+  --db-user postgres
+```
+
+Запустить симуляцию cut-off стратегии:
+
+```bash
+python src/run_cutoff_strategy.py \
+  --source postgres \
+  --db-name credit_risk_synth \
+  --db-user postgres
+```
+
 ## Результаты запуска
 
-Сгенерированные файлы сохраняются здесь:
+Файлы сохраняются здесь:
 
 ```text
 outputs/reports/
@@ -350,4 +414,4 @@ outputs/plots/
 outputs/models/
 ```
 
-Полный сгенерированный датасет не хранится в репозитории. Его можно заново создать через генератор данных.
+Полный датасет не хранится в репозитории. Его можно заново создать через генератор данных.
