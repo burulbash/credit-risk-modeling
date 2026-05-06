@@ -30,8 +30,6 @@ data/processed/
 # Local PostgreSQL loading script with machine-specific paths
 database/load_postgres_local.sql
 
-# Temporary sharing/context folders
-_share_db_context/
 
 # Model artifacts
 outputs/models/
