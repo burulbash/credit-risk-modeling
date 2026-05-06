@@ -1,0 +1,7 @@
+rating_grade,score_min,score_max,risk_level,grade_order,score_max_display
+A,750.0,inf,lowest,1,
+B,700.0,750.0,low,2,750.0
+C,650.0,700.0,medium_low,3,700.0
+D,600.0,650.0,medium,4,650.0
+E,550.0,600.0,high,5,600.0
+F,-inf,550.0,highest,6,550.0

@@ -1,0 +1,3 @@
+metric,is_monotonic_increasing_with_risk,number_of_violations,worst_step_change
+avg_predicted_pd,True,0,0.007492150654288108
+observed_default_rate,True,0,0.005806082420434884
