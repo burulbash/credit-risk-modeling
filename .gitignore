@@ -32,7 +32,6 @@ database/load_postgres_local.sql
 
 # Temporary sharing/context folders
 _share_db_context/
-db_context_for_chatgpt.zip
 
 # Model artifacts
 outputs/models/
@@ -42,3 +41,8 @@ outputs/models/
 # System files
 .DS_Store
 Thumbs.db
+
+# Local context / temporary sharing files
+local_context/
+*_context.zip
+*_share/

@@ -114,6 +114,7 @@ def build_model_pipeline(
 def get_models(
     numeric_features: list[str],
     categorical_features: list[str],
+    include_xgboost: bool = True,
 ) -> dict[str, Pipeline]:
     models: dict[str, Pipeline] = {}
 
@@ -145,14 +146,14 @@ def get_models(
         scale_numeric=False,
     )
 
-    if XGBOOST_AVAILABLE:
+    if include_xgboost and XGBOOST_AVAILABLE:
         models["xgboost"] = build_model_pipeline(
             estimator=XGBClassifier(**MODEL_PARAMS["xgboost"]),
             numeric_features=numeric_features,
             categorical_features=categorical_features,
             scale_numeric=False,
         )
-    else:
+    elif include_xgboost and not XGBOOST_AVAILABLE:
         print("XGBoost is not installed. Skipping xgboost model.")
 
     return models
@@ -264,6 +265,7 @@ def train_and_evaluate(
     feature_columns: list[str],
     numeric_features: list[str],
     categorical_features: list[str],
+    include_xgboost: bool = True,
 ) -> None:
     train_df, valid_df, oot_df, split_summary = make_time_split(df)
 
@@ -285,6 +287,7 @@ def train_and_evaluate(
     models = get_models(
         numeric_features=numeric_features,
         categorical_features=categorical_features,
+        include_xgboost=include_xgboost,
     )
 
     metrics_rows: list[dict[str, object]] = []
@@ -361,6 +364,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db-name", default="credit_risk_synth")
     parser.add_argument("--db-user", default="postgres")
     parser.add_argument("--table", default="credit_risk_modeling_mart")
+    parser.add_argument(
+        "--skip-xgboost",
+        action="store_true",
+        help="Skip XGBoost for quick local smoke runs.",
+    )
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=None,
+        help="Use only the first N rows after sorting by application date.",
+    )
 
     return parser.parse_args()
 
@@ -376,6 +390,11 @@ def main() -> None:
 
     df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
     df = df.dropna(subset=[DATE_COL, TARGET]).copy()
+
+    if args.max_rows is not None:
+        if args.max_rows <= 0:
+            raise ValueError("--max-rows must be a positive integer.")
+        df = df.sort_values(DATE_COL).head(args.max_rows).copy()
 
     print()
     print("Basic checks")
@@ -415,6 +434,7 @@ def main() -> None:
         feature_columns=feature_columns,
         numeric_features=numeric_features,
         categorical_features=categorical_features,
+        include_xgboost=not args.skip_xgboost,
     )
 
 
